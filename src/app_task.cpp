@@ -23,6 +23,8 @@
 #include <lib/support/CodeUtils.h>
 #include <system/SystemError.h>
 
+#include <app-common/zap-generated/attributes/Accessors.h>
+
 #ifdef CONFIG_CHIP_WIFI
 #include <app/clusters/network-commissioning/network-commissioning.h>
 #include <platform/nrfconnect/wifi/NrfWiFiDriver.h>
@@ -35,6 +37,7 @@
 #include <dk_buttons_and_leds.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/zephyr.h>
+#include <zephyr/drivers/sensor.h>
 
 LOG_MODULE_DECLARE(app, CONFIG_MATTER_LOG_LEVEL);
 
@@ -47,9 +50,11 @@ namespace
 {
 constexpr size_t kAppEventQueueSize = 10;
 constexpr uint32_t kFactoryResetTriggerTimeout = 6000;
+constexpr uint8_t kTemperatureMeasurementEndpointId = 1;
 
 K_MSGQ_DEFINE(sAppEventQueue, sizeof(AppEvent), kAppEventQueueSize, alignof(AppEvent));
 k_timer sFunctionTimer;
+k_timer sSensorTimer;
 
 LEDWidget sStatusLED;
 #if NUMBER_OF_LEDS == 2
@@ -62,6 +67,8 @@ FactoryResetLEDsWrapper<3> sFactoryResetLEDs{ { FACTORY_RESET_SIGNAL_LED, FACTOR
 bool sIsNetworkProvisioned = false;
 bool sIsNetworkEnabled = false;
 bool sHaveBLEConnections = false;
+bool sSensorActive = false;
+
 } /* namespace */
 
 namespace LedConsts
@@ -78,14 +85,19 @@ namespace StatusLed
 		constexpr uint32_t kOn_ms{ 50 };
 		constexpr uint32_t kOff_ms{ 950 };
 	} /* namespace Provisioned */
-
 } /* namespace StatusLed */
+	constexpr uint32_t kIdentifyBlinkRate_ms{ 500 };
 } /* namespace LedConsts */
 
 #ifdef CONFIG_CHIP_WIFI
 app::Clusters::NetworkCommissioning::Instance
 	sWiFiCommissioningInstance(0, &(NetworkCommissioning::NrfWiFiDriver::Instance()));
 #endif
+
+const struct device *sTemperatureSensor = DEVICE_DT_GET_ONE(nordic_nrf_temp);
+
+Identify AppTask::sIdentify = { kTemperatureMeasurementEndpointId, AppTask::IdentifyStartHandler, AppTask::IdentifyStopHandler,
+		       EMBER_ZCL_IDENTIFY_IDENTIFY_TYPE_VISIBLE_LED };
 
 CHIP_ERROR AppTask::Init()
 {
@@ -155,6 +167,16 @@ CHIP_ERROR AppTask::Init()
 	k_timer_init(&sFunctionTimer, &AppTask::FunctionTimerTimeoutCallback, nullptr);
 	k_timer_user_data_set(&sFunctionTimer, this);
 
+	k_timer_init(
+		&sSensorTimer,
+		[](k_timer *) {
+			AppEvent event;
+			event.Type = AppEventType::FetchSensor;
+			event.Handler = UpdateTemperatureClusterState;
+			PostEvent(event);
+		},
+		nullptr);
+
 	/* Initialize CHIP server */
 #if CONFIG_CHIP_FACTORY_DATA
 	ReturnErrorOnFailure(mFactoryDataProvider.Init());
@@ -213,6 +235,15 @@ void AppTask::ButtonEventHandler(uint32_t buttonState, uint32_t hasChanged)
 			static_cast<uint8_t>((FUNCTION_BUTTON_MASK & buttonState) ? AppEventType::ButtonPushed :
 										    AppEventType::ButtonReleased);
 		button_event.Handler = FunctionHandler;
+		PostEvent(button_event);
+	}
+
+		if (SENSOR_BUTTON_MASK & hasChanged) {
+		button_event.ButtonEvent.PinNo = SENSOR_BUTTON;
+		button_event.ButtonEvent.Action =
+			static_cast<uint8_t>((SENSOR_BUTTON_MASK & buttonState) ? AppEventType::ButtonPushed :
+										    AppEventType::ButtonReleased);
+		button_event.Handler = ControlSensorHandler;
 		PostEvent(button_event);
 	}
 }
@@ -355,4 +386,71 @@ void AppTask::DispatchEvent(const AppEvent &event)
 	} else {
 		LOG_INF("Event received with no handler. Dropping event.");
 	}
+}
+
+void AppTask::UpdateTemperatureClusterState(const AppEvent & event)
+{
+	if (event.Type != AppEventType::FetchSensor){
+		return;
+	}
+
+	sensor_value temperature;
+	int err = sensor_sample_fetch(sTemperatureSensor);
+	if (!err) {
+		err = sensor_channel_get(sTemperatureSensor, SENSOR_CHAN_DIE_TEMP, &temperature);
+		if (!err) {
+			int16_t newValue = static_cast<int16_t>(temperature.val1 * 100 +
+								temperature.val2 / 10000);
+
+			LOG_INF("Current temperature: %d", newValue);
+
+			EmberAfStatus status = Clusters::TemperatureMeasurement::Attributes::MeasuredValue::Set(
+				kTemperatureMeasurementEndpointId, newValue);
+			if (status != EMBER_ZCL_STATUS_SUCCESS) {
+				LOG_ERR("Updating temperature measurement failed %x", status);
+			}
+			return;
+		} else {
+			LOG_ERR("Getting temperature measurement data from sensor failed with: %d",
+				err);
+		}
+
+	} else {
+		LOG_ERR("Fetching data from temperature sensor failed with: %d", err);
+	}
+
+	Clusters::TemperatureMeasurement::Attributes::MeasuredValue::SetNull(
+				kTemperatureMeasurementEndpointId);
+}
+
+void AppTask::ControlSensorHandler(const AppEvent &event)
+{
+	if (event.ButtonEvent.Action == static_cast<uint8_t>(AppEventType::ButtonPushed)) {
+		sSensorActive = !sSensorActive;
+		if (sSensorActive) {
+			ChipLogDetail(DeviceLayer, "Starting timer");
+			k_timer_start(&sSensorTimer, K_SECONDS(1), K_SECONDS(1));
+		} else {
+			ChipLogDetail(DeviceLayer, "Stopping timer");
+			k_timer_stop(&sSensorTimer);
+		}
+	}
+}
+
+void AppTask::IdentifyStartHandler(Identify *)
+{
+	AppEvent event;
+	event.Type = AppEventType::IdentifyStart;
+	event.Handler = [](const AppEvent &) {
+		sFactoryResetLEDs.Blink(LedConsts::kIdentifyBlinkRate_ms); };
+	PostEvent(event);
+}
+
+void AppTask::IdentifyStopHandler(Identify *)
+{
+	AppEvent event;
+	event.Type = AppEventType::IdentifyStop;
+	event.Handler = [](const AppEvent &) {
+		sFactoryResetLEDs.Set(false); };
+	PostEvent(event);
 }
