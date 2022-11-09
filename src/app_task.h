@@ -10,6 +10,7 @@
 #include "led_widget.h"
 
 #include <platform/CHIPDeviceLayer.h>
+#include <app/clusters/identify-server/identify-server.h>
 
 #if CONFIG_CHIP_FACTORY_DATA
 #include <platform/nrfconnect/FactoryDataProvider.h>
@@ -46,8 +47,14 @@ private:
 	static void FunctionTimerTimeoutCallback(k_timer *timer);
 	static void UpdateStatusLED();
 
+	static void ControlSwitchHandler(const AppEvent &event);
+	static void IdentifyStartHandler(Identify *ident);
+	static void IdentifyStopHandler(Identify *ident);
+
 	FunctionEvent mFunction = FunctionEvent::NoneSelected;
 	bool mFunctionTimerActive = false;
+
+	static Identify sIdentify;
 
 #if CONFIG_CHIP_FACTORY_DATA
 	chip::DeviceLayer::FactoryDataProvider<chip::DeviceLayer::InternalFlashFactoryData> mFactoryDataProvider;
