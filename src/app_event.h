@@ -12,7 +12,16 @@
 
 class LEDWidget;
 
-enum class AppEventType : uint8_t { None = 0, Button, ButtonPushed, ButtonReleased, Timer, UpdateLedState };
+enum class AppEventType : uint8_t {
+	None = 0,
+	Button,
+	ButtonPushed,
+	ButtonReleased,
+	Timer,
+	UpdateLedState,
+	IdentifyStart,
+	IdentifyStop
+};
 
 enum class FunctionEvent : uint8_t { NoneSelected = 0, FactoryReset };
 

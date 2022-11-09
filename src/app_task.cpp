@@ -23,6 +23,8 @@
 #include <lib/support/CodeUtils.h>
 #include <system/SystemError.h>
 
+#include <app-common/zap-generated/attributes/Accessors.h>
+
 #ifdef CONFIG_CHIP_WIFI
 #include <app/clusters/network-commissioning/network-commissioning.h>
 #include <platform/nrfconnect/wifi/NrfWiFiDriver.h>
@@ -47,6 +49,7 @@ namespace
 {
 constexpr size_t kAppEventQueueSize = 10;
 constexpr uint32_t kFactoryResetTriggerTimeout = 6000;
+constexpr uint8_t kGenericSwitchEndpointId = 1;
 
 K_MSGQ_DEFINE(sAppEventQueue, sizeof(AppEvent), kAppEventQueueSize, alignof(AppEvent));
 k_timer sFunctionTimer;
@@ -78,14 +81,17 @@ namespace StatusLed
 		constexpr uint32_t kOn_ms{ 50 };
 		constexpr uint32_t kOff_ms{ 950 };
 	} /* namespace Provisioned */
-
 } /* namespace StatusLed */
+	constexpr uint32_t kIdentifyBlinkRate_ms{ 500 };
 } /* namespace LedConsts */
 
 #ifdef CONFIG_CHIP_WIFI
 app::Clusters::NetworkCommissioning::Instance
 	sWiFiCommissioningInstance(0, &(NetworkCommissioning::NrfWiFiDriver::Instance()));
 #endif
+
+Identify AppTask::sIdentify = { kGenericSwitchEndpointId, AppTask::IdentifyStartHandler, AppTask::IdentifyStopHandler,
+		       EMBER_ZCL_IDENTIFY_IDENTIFY_TYPE_VISIBLE_LED };
 
 CHIP_ERROR AppTask::Init()
 {
@@ -213,6 +219,15 @@ void AppTask::ButtonEventHandler(uint32_t buttonState, uint32_t hasChanged)
 			static_cast<uint8_t>((FUNCTION_BUTTON_MASK & buttonState) ? AppEventType::ButtonPushed :
 										    AppEventType::ButtonReleased);
 		button_event.Handler = FunctionHandler;
+		PostEvent(button_event);
+	}
+
+		if (SWITCH_BUTTON_MASK & hasChanged) {
+		button_event.ButtonEvent.PinNo = SWITCH_BUTTON;
+		button_event.ButtonEvent.Action =
+			static_cast<uint8_t>((SWITCH_BUTTON_MASK & buttonState) ? AppEventType::ButtonPushed :
+										    AppEventType::ButtonReleased);
+		button_event.Handler = ControlSwitchHandler;
 		PostEvent(button_event);
 	}
 }
@@ -355,4 +370,38 @@ void AppTask::DispatchEvent(const AppEvent &event)
 	} else {
 		LOG_INF("Event received with no handler. Dropping event.");
 	}
+}
+
+void AppTask::ControlSwitchHandler(const AppEvent &event)
+{
+	uint8_t newPosition {};
+
+	if (event.ButtonEvent.Action == static_cast<uint8_t>(AppEventType::ButtonPushed)) {
+		newPosition = 1;
+	}
+	else if (event.ButtonEvent.Action == static_cast<uint8_t>(AppEventType::ButtonReleased)) {
+		newPosition = 0;
+	}
+
+	DeviceLayer::SystemLayer().ScheduleLambda([newPosition] {
+		Clusters::Switch::Attributes::CurrentPosition::Set(kGenericSwitchEndpointId, newPosition);
+	});
+}
+
+void AppTask::IdentifyStartHandler(Identify *)
+{
+	AppEvent event;
+	event.Type = AppEventType::IdentifyStart;
+	event.Handler = [](const AppEvent &) {
+		sFactoryResetLEDs.Blink(LedConsts::kIdentifyBlinkRate_ms); };
+	PostEvent(event);
+}
+
+void AppTask::IdentifyStopHandler(Identify *)
+{
+	AppEvent event;
+	event.Type = AppEventType::IdentifyStop;
+	event.Handler = [](const AppEvent &) {
+		sFactoryResetLEDs.Set(false); };
+	PostEvent(event);
 }
